@@ -19,6 +19,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
+	DeferredHandle,
 	Model,
 	ModelCostRates,
 	ModelThinkingLevel,
@@ -62,6 +63,7 @@ export interface ModelsStreamTransforms {
 
 export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsStreamTransforms;
 export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamTransforms;
+export type ModelsDeferredOptions = StreamOptions & ModelsStreamTransforms;
 
 /**
  * A provider is the concrete runtime unit. It owns id/name/base metadata,
@@ -117,6 +119,8 @@ export interface Provider<TApi extends Api = Api> {
 	): AssistantMessageEventStream;
 
 	streamSimple(model: Model<TApi>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+	fetchDeferred?(model: Model<TApi>, handle: DeferredHandle, options?: StreamOptions): Promise<AssistantMessage>;
+	cancelDeferred?(model: Model<TApi>, handle: DeferredHandle, options?: StreamOptions): Promise<void>;
 }
 
 /**
@@ -184,6 +188,8 @@ export interface Models {
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream;
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage>;
+	fetchDeferred(model: Model<Api>, handle: DeferredHandle, options?: ModelsDeferredOptions): Promise<AssistantMessage>;
+	cancelDeferred(model: Model<Api>, handle: DeferredHandle, options?: ModelsDeferredOptions): Promise<void>;
 }
 
 export interface MutableModels extends Models {
@@ -524,6 +530,28 @@ class ModelsImpl implements MutableModels {
 	): Promise<AssistantMessage> {
 		return this.streamSimple(model, context, options).result();
 	}
+
+	async fetchDeferred(
+		model: Model<Api>,
+		handle: DeferredHandle,
+		options?: ModelsDeferredOptions,
+	): Promise<AssistantMessage> {
+		const provider = this.requireProvider(model);
+		if (!provider.fetchDeferred) {
+			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		}
+		const { requestModel, requestOptions } = await this.applyAuth(model, options);
+		return provider.fetchDeferred(requestModel, handle, requestOptions);
+	}
+
+	async cancelDeferred(model: Model<Api>, handle: DeferredHandle, options?: ModelsDeferredOptions): Promise<void> {
+		const provider = this.requireProvider(model);
+		if (!provider.cancelDeferred) {
+			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		}
+		const { requestModel, requestOptions } = await this.applyAuth(model, options);
+		await provider.cancelDeferred(requestModel, handle, requestOptions);
+	}
 }
 
 export function createModels(options?: CreateModelsOptions): MutableModels {
@@ -586,7 +614,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		return run(streams);
 	};
 
-	return {
+	const provider: Provider<TApi> = {
 		id: input.id,
 		name: input.name ?? input.id,
 		baseUrl: input.baseUrl,
@@ -620,6 +648,34 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		streamSimple: (model, context, options) =>
 			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
 	};
+
+	const streams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);
+	if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
+		provider.fetchDeferred = async (model, handle, options) => {
+			const implementation = apiFor(model);
+			if (!implementation?.fetchDeferred) {
+				throw new ModelsError(
+					"provider",
+					`Provider ${input.id} does not support deferred responses for "${model.api}"`,
+				);
+			}
+			return implementation.fetchDeferred(model, handle, options);
+		};
+	}
+	if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
+		provider.cancelDeferred = async (model, handle, options) => {
+			const implementation = apiFor(model);
+			if (!implementation?.cancelDeferred) {
+				throw new ModelsError(
+					"provider",
+					`Provider ${input.id} cannot cancel deferred responses for "${model.api}"`,
+				);
+			}
+			await implementation.cancelDeferred(model, handle, options);
+		};
+	}
+
+	return provider;
 }
 
 /**
