@@ -1,5 +1,6 @@
 import { Box, Markdown, type MarkdownTheme, Text } from "@earendil-works/pi-tui";
 import type { ParsedSkillBlock } from "../../../core/agent-session.ts";
+import { formatSkillInvocationDuration, type SkillInvocationTiming } from "../../../core/skill-invocation-tracker.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { keyText } from "./keybinding-hints.ts";
 
@@ -12,11 +13,22 @@ export class SkillInvocationMessageComponent extends Box {
 	private expanded = false;
 	private skillBlock: ParsedSkillBlock;
 	private markdownTheme: MarkdownTheme;
+	private timing: SkillInvocationTiming | undefined;
 
-	constructor(skillBlock: ParsedSkillBlock, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
+	constructor(
+		skillBlock: ParsedSkillBlock,
+		markdownTheme: MarkdownTheme = getMarkdownTheme(),
+		timing?: SkillInvocationTiming,
+	) {
 		super(1, 1, (t) => theme.bg("customMessageBg", t));
 		this.skillBlock = skillBlock;
 		this.markdownTheme = markdownTheme;
+		this.timing = timing;
+		this.updateDisplay();
+	}
+
+	setTiming(timing: SkillInvocationTiming | undefined): void {
+		this.timing = timing;
 		this.updateDisplay();
 	}
 
@@ -35,7 +47,7 @@ export class SkillInvocationMessageComponent extends Box {
 
 		if (this.expanded) {
 			// Expanded: label + skill name header + full content
-			const label = theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m`);
+			const label = theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m`) + this.formatTiming();
 			this.addChild(new Text(label, 0, 0));
 			const header = `**${this.skillBlock.name}**\n\n`;
 			this.addChild(
@@ -44,12 +56,20 @@ export class SkillInvocationMessageComponent extends Box {
 				}),
 			);
 		} else {
-			// Collapsed: single line - [skill] name (hint to expand)
+			// Collapsed: single line - [skill] name · timing (hint to expand)
 			const line =
 				theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
 				theme.fg("customMessageText", this.skillBlock.name) +
+				this.formatTiming() +
 				theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
 			this.addChild(new Text(line, 0, 0));
 		}
+	}
+
+	private formatTiming(): string {
+		if (!this.timing) return "";
+		const duration = formatSkillInvocationDuration(this.timing.durationMs);
+		if (this.timing.outcome === "success") return theme.fg("success", ` · ✓ ${duration}`);
+		return theme.fg("error", ` · ✗ ${duration}`);
 	}
 }
