@@ -92,6 +92,11 @@ import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import type { UiMode } from "../../core/settings-manager.ts";
+import {
+	isSkillInvocationTiming,
+	SKILL_TIMING_CUSTOM_TYPE,
+	type SkillInvocationTiming,
+} from "../../core/skill-invocation-tracker.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -395,6 +400,10 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+
+	// Skill invocation timing: invocationId -> timing/component
+	private skillTimingByInvocationId = new Map<string, SkillInvocationTiming>();
+	private skillComponentsByInvocationId = new Map<string, SkillInvocationMessageComponent>();
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -3284,6 +3293,10 @@ export class InteractiveMode {
 	}
 
 	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>): void {
+		if (this.applySkillTimingEntry(entry)) {
+			return;
+		}
+
 		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
 		if (!renderer) {
 			return;
@@ -3303,6 +3316,20 @@ export class InteractiveMode {
 		}
 
 		this.chatContainer.addChild(component);
+	}
+
+	private applySkillTimingEntry(entry: Extract<SessionEntry, { type: "custom" }>): boolean {
+		if (entry.customType !== SKILL_TIMING_CUSTOM_TYPE || !isSkillInvocationTiming(entry.data)) {
+			return false;
+		}
+
+		const timing = entry.data;
+		this.skillTimingByInvocationId.set(timing.invocationId, timing);
+		const component = this.skillComponentsByInvocationId.get(timing.invocationId);
+		if (component) {
+			component.setTiming(timing);
+		}
+		return true;
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
@@ -3358,11 +3385,18 @@ export class InteractiveMode {
 					const skillBlock = parseSkillBlock(textContent);
 					if (skillBlock) {
 						// Render skill block (collapsible)
+						const timing = skillBlock.invocationId
+							? this.skillTimingByInvocationId.get(skillBlock.invocationId)
+							: undefined;
 						const component = new SkillInvocationMessageComponent(
 							skillBlock,
 							this.getMarkdownThemeWithSettings(),
+							timing,
 						);
 						component.setExpanded(this.toolOutputExpanded);
+						if (skillBlock.invocationId) {
+							this.skillComponentsByInvocationId.set(skillBlock.invocationId, component);
+						}
 						this.chatContainer.addChild(component);
 						// Render user message separately if present
 						if (skillBlock.userMessage) {
@@ -3417,6 +3451,8 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
+		this.skillTimingByInvocationId?.clear();
+		this.skillComponentsByInvocationId?.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		// Cache-miss notices are not persisted; re-derive them from the full entry
 		// list and re-inject them after the assistant messages that paid for them.

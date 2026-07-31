@@ -100,6 +100,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
+import { SKILL_TIMING_CUSTOM_TYPE, SkillInvocationTracker } from "./skill-invocation-tracker.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
@@ -116,6 +117,7 @@ import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 export interface ParsedSkillBlock {
 	name: string;
 	location: string;
+	invocationId: string | undefined;
 	content: string;
 	userMessage: string | undefined;
 }
@@ -125,13 +127,16 @@ export interface ParsedSkillBlock {
  * Returns null if the text doesn't contain a skill block.
  */
 export function parseSkillBlock(text: string): ParsedSkillBlock | null {
-	const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+	const match = text.match(
+		/^<skill name="([^"]+)" location="([^"]+)"(?: invocation-id="([^"]+)")?>\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/,
+	);
 	if (!match) return null;
 	return {
 		name: match[1],
 		location: match[2],
-		content: match[3],
-		userMessage: match[4]?.trim() || undefined,
+		invocationId: match[3],
+		content: match[4],
+		userMessage: match[5]?.trim() || undefined,
 	};
 }
 
@@ -371,6 +376,7 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private readonly _skillInvocationTracker = new SkillInvocationTracker();
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -578,9 +584,10 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private async _emitAgentSettled(options: { agentError?: boolean } = {}): Promise<void> {
 		this._isAgentRunActive = false;
 		try {
+			this._recordSkillInvocationTiming(options);
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
@@ -617,6 +624,12 @@ export class AgentSession {
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
+
+		if (event.type === "tool_execution_end") {
+			this._skillInvocationTracker.observeToolEnd(event.isError);
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			this._skillInvocationTracker.observeAssistantEnd((event.message as AssistantMessage).stopReason);
+		}
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
@@ -1060,16 +1073,33 @@ export class AgentSession {
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
+		let agentError = false;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		} catch (error) {
+			agentError = true;
+			throw error;
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			await this._emitAgentSettled({ agentError });
 		}
+	}
+
+	private _recordSkillInvocationTiming(options: { aborted?: boolean; agentError?: boolean } = {}): void {
+		const results = this._skillInvocationTracker.settleAll(options);
+		for (const result of results) {
+			const entryId = this.sessionManager.appendCustomEntry(SKILL_TIMING_CUSTOM_TYPE, result);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+		}
+	}
+
+	private _handleSkillExpansion(text: string): string {
+		return this._expandSkillCommand(text);
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1151,7 +1181,7 @@ export class AgentSession {
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
-				expandedText = this._expandSkillCommand(expandedText);
+				expandedText = this._handleSkillExpansion(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
@@ -1311,7 +1341,13 @@ export class AgentSession {
 		try {
 			const content = readFileSync(skill.filePath, "utf-8");
 			const body = stripFrontmatter(content).trim();
-			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+			const invocationId = this._skillInvocationTracker.start({
+				skillName: skill.name,
+				location: skill.filePath,
+				baseDir: skill.baseDir,
+				source: "explicit-slash",
+			});
+			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}" invocation-id="${invocationId}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
 			return args ? `${skillBlock}\n\n${args}` : skillBlock;
 		} catch (err) {
 			// Emit error like extension commands do
@@ -1339,7 +1375,7 @@ export class AgentSession {
 		}
 
 		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
+		let expandedText = this._handleSkillExpansion(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueSteer(expandedText, images);
@@ -1359,7 +1395,7 @@ export class AgentSession {
 		}
 
 		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
+		let expandedText = this._handleSkillExpansion(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueFollowUp(expandedText, images);
