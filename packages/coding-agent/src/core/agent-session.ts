@@ -1781,8 +1781,9 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		this._disconnectFromAgent();
 		await this.abort();
+		// Process the final aborted message before disconnecting; otherwise stale usage can trigger auto-compaction before this manual compaction.
+		this._disconnectFromAgent();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 
