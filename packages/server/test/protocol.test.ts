@@ -197,6 +197,11 @@ describe("pi-ai protocol bridge", () => {
 		assertValidServerPayload(result);
 	});
 
+	test("rejects invalid message timestamps", () => {
+		const user = { role: "user", content: "hello", timestamp: Number.NaN } satisfies UserMessage;
+		expect(() => toProtocolUserMessage(user, { id: "user-invalid-time" })).toThrow(TypeError);
+	});
+
 	test("rejects lossy tool input conversions", () => {
 		const circular: Record<string, unknown> = {};
 		circular.self = circular;

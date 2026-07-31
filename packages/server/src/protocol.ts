@@ -56,7 +56,8 @@ function nonNegativeNumber(value: number): number {
 }
 
 function timestamp(value: number): number {
-	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : Date.now();
+	if (!Number.isFinite(value) || value < 0) throw new TypeError(`Protocol timestamps must be non-negative: ${value}`);
+	return Math.floor(value);
 }
 
 /** Validate and copy a value from an execution boundary into the protocol's JSON-compatible subset. */
